@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"strconv"
 
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/internal"
@@ -15,12 +16,19 @@ import (
 	"github.com/eclipse/paho.mqtt.golang"
 )
 
+type TemplateNode struct {
+	tmpl []string
+	tn map[string]*TemplateNode
+}
+
 type MQTTConsumer struct {
 	Servers  []string
 	Topics   []string
 	Username string
 	Password string
 	QoS      int `toml:"qos"`
+	TopicsTemplates    []string
+	TopicsTemplateTree TemplateNode
 
 	parser parsers.Parser
 
@@ -105,6 +113,11 @@ func (m *MQTTConsumer) Start(acc telegraf.Accumulator) error {
 	defer m.Unlock()
 	m.started = false
 
+	err := m.prepTopicsTemplateTree()
+	if err != nil {
+		return err
+	}
+
 	if m.PersistentSession && m.ClientID == "" {
 		return fmt.Errorf("ERROR MQTT Consumer: When using persistent_session" +
 			" = true, you MUST also set client_id")
@@ -164,19 +177,177 @@ func (m *MQTTConsumer) receiver() {
 			return
 		case msg := <-m.in:
 			topic := msg.Topic()
-			metrics, err := m.parser.Parse(msg.Payload())
-			if err != nil {
-				log.Printf("MQTT PARSE ERROR\nmessage: %s\nerror: %s",
-					string(msg.Payload()), err.Error())
-			}
+			payload := msg.Payload()
 
-			for _, metric := range metrics {
-				tags := metric.Tags()
-				tags["topic"] = topic
-				m.acc.AddFields(metric.Name(), metric.Fields(), tags, metric.Time())
+			if len(m.TopicsTemplates) > 0 {
+				tlns := strings.Split(topic, "/")
+				tmpls, tmpl_found := m.getTemplateForTopic(tlns)
+				if tmpl_found {
+					for _, tmpl := range tmpls {
+						a_payload, _ := rewr(tlns, payload, tmpl)
+						metric, err := m.parser.ParseLine(a_payload)
+						if err != nil {
+							log.Printf("E! MQTT Parse Error\nmessage: %s\nerror: %s",
+								string(a_payload), err.Error())
+						} else {
+							m.acc.AddFields(metric.Name(), metric.Fields(), metric.Tags(), metric.Time())
+						}
+					}
+				}
+			} else {
+				metrics, err := m.parser.Parse(payload)
+				if err != nil {
+					log.Printf("E! MQTT Parse Error\nmessage: %s\nerror: %s",
+						string(payload), err.Error())
+				}
+
+				for _, metric := range metrics {
+					tags := metric.Tags()
+					tags["topic"] = topic
+					m.acc.AddFields(metric.Name(), metric.Fields(), tags, metric.Time())
+				}
 			}
 		}
 	}
+}
+
+func getTopicNodeFromIdx(topic *[]string, idx int) (string, bool) {
+	t := *topic
+	if idx == 0 {
+		idx = len(t) - 1
+	} else if idx < 0 {
+		idx = len(t) - 1 + idx
+	} else {
+		idx--;
+	}
+	if idx > (len(t) - 1) {
+		return "", false
+	}
+
+	return t[idx], true
+}
+
+func rewr(topic []string, val []byte, tmpl string) (string, bool) {
+	s := strings.FieldsFunc(tmpl, func(c rune) bool {
+		return c == '{' || c == '}'
+	})
+
+	for i := 1; i < len(s); i++ {
+		idx, err := strconv.Atoi(s[i])
+		if err == nil {
+			res, resOk := getTopicNodeFromIdx(&topic, idx)
+			if resOk {
+				s[i] = res
+			} else {
+				return "", false
+			}
+		} else if s[i] == "v" {
+			s[i] = string(val)
+		} else {
+			sa := strings.Split(s[i], ",")
+			res := ""
+			if len(sa) == 2 {
+				kIdx, err := strconv.Atoi(sa[0])
+				if err != nil && sa[0] == "k" {
+					kIdx = len(topic) - 1
+					err = nil
+				}
+				if err == nil {
+					kTn, resOk := getTopicNodeFromIdx(&topic, kIdx)
+					if resOk {
+						vTn := ""
+						resOk = true
+						vIdx, err := strconv.Atoi(sa[1])
+						if err == nil {
+							vTn, resOk = getTopicNodeFromIdx(&topic, vIdx)
+						} else if sa[1] == "v" {
+							vTn = string(val)
+							err = nil
+						}
+						if resOk {
+							ks := strings.Split(kTn, ",")
+							vs := strings.Split(vTn, ",")
+							if len(ks) == len(vs) {
+								ts := make([]string, len(ks))
+
+								for i, key := range ks {
+									ts[i] = strings.TrimSpace(key) + "=" + strings.TrimSpace(vs[i])
+								}
+								res = strings.Join(ts, ",")
+							}
+						}
+					}
+				}
+			}
+			s[i] = res
+		}
+		i++
+	}
+
+	return strings.Join(s, ""), true
+}
+
+func (m *MQTTConsumer) prepTopicsTemplateTree() error {
+	m.TopicsTemplateTree.tn = make(map[string]*TemplateNode)
+	for _, template := range m.TopicsTemplates {
+		tmpl := strings.Split(template, ";")
+		tlns := strings.Split(tmpl[0], "/")
+		m.addTopicFilterTemplate(&m.TopicsTemplateTree, tlns, tmpl[1:])
+	}
+	return nil
+}
+
+func (m *MQTTConsumer) addTopicFilterTemplate(topicNode *TemplateNode, tlns []string, template []string) error {
+	if len(tlns) > 0 {
+		tln := tlns[0]
+		if len(tln) == 0 {
+			tln = "/"
+		}
+		tn, prs := topicNode.tn[tln]
+
+		if !prs {
+			tn = new(TemplateNode)
+			tn.tn = make(map[string]*TemplateNode)
+			topicNode.tn[tln] = tn
+		}
+
+		m.addTopicFilterTemplate(tn, tlns[1:],template)
+	} else {
+		topicNode.tmpl = template;
+	}
+	return nil
+}
+
+func (m *MQTTConsumer) findTemplateForTopic(topicNode *TemplateNode, tlns []string) ([]string, bool) {
+	if len(tlns) > 0 {
+		tln := tlns[0]
+		if len(tln) == 0 {
+			tln = "/"
+		}
+		tn, prs := topicNode.tn[tln]
+		if !prs {
+			tn, prs = topicNode.tn["+"]
+		}
+		if prs {
+			tmpl, res := m.findTemplateForTopic(tn, tlns[1:])
+			if len(tmpl) > 0 {
+				return tmpl, res
+			}
+		}
+		tn, prs = topicNode.tn["#"]
+		if prs {
+			return tn.tmpl, true
+		} else {
+			return make([]string, 0), false
+		}
+	} else {
+		return topicNode.tmpl, true
+	}
+}
+
+func (m *MQTTConsumer) getTemplateForTopic(tlns []string) ([]string, bool) {
+	tmpl, res := m.findTemplateForTopic(&m.TopicsTemplateTree, tlns)
+	return tmpl, res
 }
 
 func (m *MQTTConsumer) recvMessage(_ mqtt.Client, msg mqtt.Message) {
@@ -246,3 +417,4 @@ func init() {
 		return &MQTTConsumer{}
 	})
 }
+
